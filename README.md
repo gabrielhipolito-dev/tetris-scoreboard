@@ -75,11 +75,22 @@ Keep the `fonts` folder next to `app.py`. Without it, the app still works but us
 
 You do not need Node.js, npm or pnpm for this version.
 
+### 3.1 Clone the project
+
+Install [Git](https://git-scm.com/downloads) if it is not already installed, then open a terminal and run:
+
+```
+git clone https://github.com/gabrielhipolito-dev/tetris-scoreboard.git
+cd tetris-scoreboard
+```
+
+This downloads the project into a new `tetris-scoreboard` folder and moves your terminal into that folder. You can then continue with the setup steps below.
+
 ---
 
 ## 4. One-time setup, command by command
 
-All commands are typed in a terminal opened inside the `tetris-scoreboard` folder. In VS Code: **Terminal > New Terminal**.
+All commands below are typed in a terminal opened inside the `tetris-scoreboard` folder. In VS Code: **Terminal > New Terminal**.
 
 ### 4.1 Go to the project folder
 
