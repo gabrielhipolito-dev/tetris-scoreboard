@@ -62,7 +62,7 @@ def now_str():
 class Backend(QObject):
   connection = Signal(bool)
   match = Signal(object) # dict describing the current match
-  saved = Signal()    # a row was written to the CSV
+  saved = Signal(object)  # the saved CSV row
   live = Signal(object)  # live score update while a game is being played
 
   def __init__(self):
@@ -140,7 +140,7 @@ class Backend(QObject):
         self.match.emit({"game": game, "mode": "1P", "winner": "solo",
                  "players": {player: entry},
                  "roast": self.roast(entry, entry, "solo")})
-        self.saved.emit()
+        self.saved.emit(row)
         return
 
       g = self.pending.setdefault(game, {"t": time.time()})
@@ -168,7 +168,7 @@ class Backend(QObject):
         self.match.emit({"game": game, "mode": "2P", "winner": winner,
                  "players": {1: p1, 2: p2},
                  "roast": self.roast(p1, p2, winner)})
-        self.saved.emit()
+        self.saved.emit(row)
       else: # one player is still typing a name
         self.match.emit({"game": game, "mode": "2P", "winner": None,
                  "players": {k: v for k, v in g.items() if k in (1, 2)},
@@ -842,10 +842,12 @@ class MainWindow(QMainWindow):
     backend.connection.connect(self.on_connection)
     backend.match.connect(self.on_match)
     backend.live.connect(self.on_live)
-    backend.saved.connect(self.refresh_data)
+    backend.saved.connect(self.on_saved)
+
+    self.matches = []
 
     self.on_connection(False)
-    self.refresh_data()
+    self.reload_data()
     self.go(0)
 
   def go(self, i):
@@ -868,11 +870,22 @@ class MainWindow(QMainWindow):
     self.match_page.show_match(m)
     self.go(0)
 
+  @staticmethod
+  def _normalize_row(row):
+    return {k: "" if row.get(k) is None else str(row.get(k)) for k in FIELDS}
+
+  def reload_data(self):
+    self.matches = read_matches()
+    self.refresh_data()
+
+  def on_saved(self, row):
+    self.matches.append(self._normalize_row(row))
+    self.refresh_data()
+
   def refresh_data(self):
-    matches = read_matches()
-    self.board.refresh(matches)
-    self.records.refresh(matches)
-    self.history.refresh(matches)
+    self.board.refresh(self.matches)
+    self.records.refresh(self.matches)
+    self.history.refresh(self.matches)
 
 
 def main():
