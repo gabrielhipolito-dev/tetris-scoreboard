@@ -64,13 +64,55 @@ class Backend(QObject):
   match = Signal(object) # dict describing the current match
   saved = Signal(object)  # the saved CSV row
   live = Signal(object)  # live score update while a game is being played
+  force_quit = Signal(object)  # payload emitted when Arduino reports force quit
 
   def __init__(self):
     super().__init__()
     self.live_games = {} # game id -> {"mode", "players": {1: entry, 2: entry}, "t"}
     self.pending = {}  # game id -> {1: entry, 2: entry, "t": time}
+    self.solo_state = {} # player -> {"entry", "live", "game", "t"}
     self.lock = threading.Lock()
     self.auto_game_id = 1000
+    self.last_serial_error = ""
+    self.last_serial_error_at = 0.0
+
+  @staticmethod
+  def _solo_winner(players):
+    if 1 in players and 2 in players:
+      if players[1]["score"] > players[2]["score"]:
+        return 1
+      if players[2]["score"] > players[1]["score"]:
+        return 2
+      return "tie"
+    return "solo"
+
+  def _emit_solo_view(self, new_live=False):
+    """Emit a consolidated 1P view so both solo players can be shown together."""
+    now = time.time()
+    for p in [k for k, v in self.solo_state.items() if now - v["t"] > 30]:
+      del self.solo_state[p]
+    if not self.solo_state:
+      return
+
+    players = {p: dict(v["entry"]) for p, v in self.solo_state.items()}
+    live_any = any(v["live"] for v in self.solo_state.values())
+    game = max(v["game"] for v in self.solo_state.values())
+
+    for p, v in self.solo_state.items():
+      players[p]["live"] = bool(v["live"])
+
+    winner = None if live_any else self._solo_winner(players)
+    payload = {"game": game, "mode": "1P", "winner": winner,
+           "players": players, "live": live_any,
+           "roast": "" if live_any else self.roast(
+             players.get(1, players.get(2)),
+             players.get(2, players.get(1)),
+             winner if winner in (1, 2, "tie") else "solo")}
+    if live_any:
+      payload["new"] = bool(new_live)
+      self.live.emit(payload)
+    else:
+      self.match.emit(payload)
 
   @staticmethod
   def roast(p1, p2, winner):
@@ -95,6 +137,21 @@ class Backend(QObject):
       w.writerow(row)
 
   @staticmethod
+  def clear_mode_rows(mode):
+    if not os.path.exists(CSV_FILE):
+      return 0
+    with open(CSV_FILE, newline="") as f:
+      rows = list(csv.DictReader(f))
+    kept = [r for r in rows if (r.get("mode", "") or "").upper() != mode.upper()]
+    removed = len(rows) - len(kept)
+    with open(CSV_FILE, "w", newline="") as f:
+      w = csv.DictWriter(f, fieldnames=FIELDS)
+      w.writeheader()
+      for r in kept:
+        w.writerow({k: r.get(k, "") for k in FIELDS})
+    return removed
+
+  @staticmethod
   def blank_row(game, mode):
     return {"time": now_str(), "game": game, "mode": mode, "p1_name": "", "p1_score": "",
         "p1_level": "", "p2_name": "", "p2_score": "", "p2_level": "", "winner": ""}
@@ -108,6 +165,12 @@ class Backend(QObject):
          "score": int(d.get("score", 0)), "level": int(d.get("level", 1)),
          "won": False}
     with self.lock:
+      if mode == "1P":
+        prev = self.solo_state.get(player)
+        new_live = prev is None or prev.get("game") != game
+        self.solo_state[player] = {"entry": entry, "live": True, "game": game, "t": time.time()}
+        self._emit_solo_view(new_live)
+        return
       for old in [k for k, v in self.live_games.items() if time.time() - v["t"] > 600]:
         del self.live_games[old]
       g = self.live_games.get(game)
@@ -137,9 +200,8 @@ class Backend(QObject):
           entry["name"], entry["score"], entry["level"])
         row["winner"] = "solo"
         self.save_row(row)
-        self.match.emit({"game": game, "mode": "1P", "winner": "solo",
-                 "players": {player: entry},
-                 "roast": self.roast(entry, entry, "solo")})
+        self.solo_state[player] = {"entry": entry, "live": False, "game": game, "t": time.time()}
+        self._emit_solo_view(False)
         self.saved.emit(row)
         return
 
@@ -174,65 +236,127 @@ class Backend(QObject):
                  "players": {k: v for k, v in g.items() if k in (1, 2)},
                  "roast": ""})
 
+  def handle_force_quit(self, d):
+    mode = d.get("mode", "")
+    player = int(d.get("player", 0) or 0)
+    game = int(d.get("game", 0) or 0)
+    removed = 0
+    with self.lock:
+      if mode == "1P":
+        removed = self.clear_mode_rows("1P")
+        self.solo_state.clear()
+      elif mode == "2P" and player in self.solo_state:
+        del self.solo_state[player]
+    self.force_quit.emit({"mode": mode, "player": player, "game": game, "removed": removed})
+
   # ----- serial -----
   @staticmethod
-  def find_port():
+  def find_ports():
     ports = list(serial.tools.list_ports.comports())
+    if not ports:
+      return []
+
+    preferred, other = [], []
     for p in ports:
-      if any(k in p.description for k in ("Arduino", "CH340", "USB Serial")):
-        return p.device
-    return ports[0].device if ports else None
+      desc = (p.description or "")
+      if any(k in desc for k in ("Arduino", "CH340", "USB Serial")):
+        preferred.append(p.device)
+      else:
+        other.append(p.device)
+    return preferred + other
+
+  def _log_serial_error(self, message):
+    now = time.time()
+    # Avoid flooding logs with the same reconnect error every retry tick.
+    if message == self.last_serial_error and (now - self.last_serial_error_at) < 8:
+      return
+    self.last_serial_error = message
+    self.last_serial_error_at = now
+    print(message)
+
+  @staticmethod
+  def _is_ping_line(line):
+    """Detect standalone PING token even with mixed separators/casing."""
+    cleaned = "".join(ch if ch.isalnum() else " " for ch in line.upper())
+    return "PING" in cleaned.split()
+
+  @staticmethod
+  def _send_pong(ser, repeats=2):
+    # Repeat and flush to tolerate transient serial timing losses during submit handshake.
+    for _ in range(max(1, repeats)):
+      ser.write(b"PONG\r\n")
+    ser.flush()
 
   def run_serial(self):
     while True:
-      port = self.find_port()
-      if not port:
+      ports = self.find_ports()
+      if not ports:
         self.connection.emit(False)
         time.sleep(2)
         continue
-      try:
-        ser = serial.Serial(port, BAUD, timeout=0.2)
-        time.sleep(2) # the Arduino resets when the port opens
-        with self.lock:
-          self.live_games.clear()
-        self.connection.emit(True)
-        while True:
-          line = ser.readline().decode(errors="ignore").strip()
-          if not line:
-            continue
-          if "PING" in line:
-            ser.write(b"PONG\n")
-          elif line.startswith("{"):
-            try:
-              d = json.loads(line)
-              ev = d.get("event")
-              if ev == "LIVE":
-                self.handle_live(d)
-              elif ev == "SCORE_SUBMIT":
-                self.handle_score(d)
-            except (ValueError, KeyError):
-              print("Bad data:", line)
-          else:
-            # Flexible CSV parser: player,name,score,level,won
-            # Example from Arduino: Serial.println("1,MAYA,75000,5,1");
-            try:
-              parts = [p.strip() for p in line.split(",")]
-              if len(parts) >= 5:
-                self.auto_game_id += 1
-                d = {
-                  "player": int(parts[0]),
-                  "name": parts[1],
-                  "score": int(parts[2]),
-                  "level": int(parts[3]),
-                  "won": int(parts[4]),
-                  "game": self.auto_game_id,
-                  "mode": "1P"
-                }
-                self.handle_score(d)
-            except Exception as e:
-              print("Ignored line:", line, e)
-      except serial.SerialException as e:
-        print("Serial lost:", e)
+
+      connected = False
+      for port in ports:
+        try:
+          ser = serial.Serial(port, BAUD, timeout=0.2)
+          connected = True
+          time.sleep(2) # the Arduino resets when the port opens
+          with self.lock:
+            self.live_games.clear()
+          self.connection.emit(True)
+          self._log_serial_error(f"Serial connected: {port}")
+          last_keepalive_pong = 0.0
+
+          while True:
+            now = time.time()
+            if (now - last_keepalive_pong) >= 1.0:
+              self._send_pong(ser, repeats=1)
+              last_keepalive_pong = now
+
+            line = ser.readline().decode(errors="ignore").strip()
+            if not line:
+              continue
+            if self._is_ping_line(line):
+              self._send_pong(ser, repeats=3)
+            elif line.startswith("{"):
+              try:
+                d = json.loads(line)
+                ev = d.get("event")
+                if ev == "LIVE":
+                  self.handle_live(d)
+                elif ev == "SCORE_SUBMIT":
+                  self.handle_score(d)
+                elif ev == "FORCE_QUIT":
+                  self.handle_force_quit(d)
+              except (ValueError, KeyError):
+                print("Bad data:", line)
+            else:
+              # Flexible CSV parser: player,name,score,level,won
+              # Example from Arduino: Serial.println("1,MAYA,75000,5,1");
+              try:
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) >= 5:
+                  self.auto_game_id += 1
+                  d = {
+                    "player": int(parts[0]),
+                    "name": parts[1],
+                    "score": int(parts[2]),
+                    "level": int(parts[3]),
+                    "won": int(parts[4]),
+                    "game": self.auto_game_id,
+                    "mode": "1P"
+                  }
+                  self.handle_score(d)
+              except Exception as e:
+                print("Ignored line:", line, e)
+
+        except serial.SerialException as e:
+          connected = False
+          self.connection.emit(False)
+          self._log_serial_error(f"Serial skipped ({port}): {e}")
+          continue
+
+      if not connected:
         self.connection.emit(False)
         time.sleep(2)
 
@@ -380,8 +504,6 @@ class PlayerCard(QFrame):
 
 
 class MatchPage(QWidget):
-  next_clicked = Signal()
-
   def __init__(self):
     super().__init__()
     self.match = None
@@ -432,15 +554,8 @@ class MatchPage(QWidget):
     self.roast_on.setChecked(True)
     self.roast_on.setStyleSheet(f"font-size:13px; color:{TEXT}; spacing:8px;")
     self.roast_on.toggled.connect(self.refresh_roast)
-    nxt = QPushButton("Next match")
-    nxt.setCursor(Qt.PointingHandCursor)
-    nxt.setStyleSheet(f"QPushButton {{ background:{TEXT}; color:{BG}; border:none; border-radius:6px;"
-             f" padding:12px 20px; font-size:14px; font-weight:600; }}"
-             f"QPushButton:hover {{ background:#FFFFFF; }}")
-    nxt.clicked.connect(self.next_clicked.emit)
     h.addLayout(col2, 1)
     h.addWidget(self.roast_on)
-    h.addWidget(nxt)
     v.addWidget(bar)
 
     self._pulse = False
@@ -497,13 +612,35 @@ class MatchPage(QWidget):
     players, w = m["players"], m["winner"]
 
     if m["mode"] == "1P" or w == "solo":
-      self.subtitle.setText("Game in progress" if live else "Solo run")
-      only = next(iter(players))
-      self._stretches(True)
-      card, other = (self.c1, self.c2) if only == 1 else (self.c2, self.c1)
-      other.hide()
-      card.show()
-      card.set_entry(players[only], "live" if live else "solo")
+      if len(players) == 1:
+        self.subtitle.setText("Game in progress" if live else "Solo run")
+        only = next(iter(players))
+        self._stretches(True)
+        card, other = (self.c1, self.c2) if only == 1 else (self.c2, self.c1)
+        other.hide()
+        card.show()
+        state = "live" if players[only].get("live", live) else "solo"
+        card.set_entry(players[only], state)
+      else:
+        self._stretches(False)
+        self.c1.show()
+        self.c2.show()
+        if live:
+          self.subtitle.setText("Dual solo in progress")
+          for n, card in ((1, self.c1), (2, self.c2)):
+            if n in players:
+              state = "live" if players[n].get("live", False) else "pending"
+              card.set_entry(players[n], state)
+            else:
+              card.set_ghost("Not joined")
+        else:
+          self.subtitle.setText("Dual solo complete")
+          if w == "tie":
+            self.c1.set_entry(players[1], "tie")
+            self.c2.set_entry(players[2], "tie")
+          else:
+            self.c1.set_entry(players[1], "winner" if w == 1 else "loser")
+            self.c2.set_entry(players[2], "winner" if w == 2 else "loser")
     else:
       self._stretches(False)
       self.c1.show()
@@ -838,11 +975,11 @@ class MainWindow(QMainWindow):
       self.stack.addWidget(Centered(page, w))
     outer.addWidget(self.stack, 1)
 
-    self.match_page.next_clicked.connect(self.match_page.show_waiting)
     backend.connection.connect(self.on_connection)
     backend.match.connect(self.on_match)
     backend.live.connect(self.on_live)
     backend.saved.connect(self.on_saved)
+    backend.force_quit.connect(self.on_force_quit)
 
     self.matches = []
 
@@ -886,6 +1023,11 @@ class MainWindow(QMainWindow):
     self.board.refresh(self.matches)
     self.records.refresh(self.matches)
     self.history.refresh(self.matches)
+
+  def on_force_quit(self, payload):
+    if payload.get("mode") == "1P":
+      self.reload_data()
+      self.match_page.show_waiting()
 
 
 def main():
